@@ -1,0 +1,324 @@
+import requests
+from datetime import datetime, timedelta
+from telegram import ReplyKeyboardMarkup, Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters
+)
+
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+TOKEN = os.getenv("BOT_TOKEN")
+WEATHER_API_KEY = os.getenv("WEATHER_API_KEY")
+
+# ================== /start ==================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [["Старт"]]
+
+    reply_markup = ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+    await update.message.reply_text(
+        "Привет! 👋\n\n"
+        "Я Ваш погодный помощник 🌤\n"
+        "Моя задача — показывать Вам погоду в выбранном городе.\n\n"
+        "Чтобы начать, нажми кнопку «Старт» 👇",
+        reply_markup=reply_markup
+    )
+
+
+# ================== кнопка "Старт" ==================
+async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Отлично! 👍\n\n"
+        "Напишите название города, погоду для которого Вы хотите узнать 🌍"
+    )
+
+
+# ================== обработка текста (город) ==================
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    city = update.message.text.title()  # форматируем красиво
+    context.user_data["city"] = city
+
+    # обновляем список последних 4 городов
+    recent = context.user_data.get("recent_cities", [])
+    if city in recent:
+        recent.remove(city)
+    recent.insert(0, city)
+    if len(recent) > 4:
+        recent = recent[:4]
+    context.user_data["recent_cities"] = recent
+
+    url = (
+        "https://api.openweathermap.org/data/2.5/weather"
+        f"?q={city}&appid={WEATHER_API_KEY}&units=metric&lang=ru"
+    )
+    response = requests.get(url)
+    data = response.json()
+
+    if response.status_code != 200:
+        await update.message.reply_text(
+            "Не удалось найти такой город 😔\n"
+            "Попробуйте написать название ещё раз."
+        )
+        return
+
+    temp = round(data["main"]["temp"])
+    feels_like = round(data["main"]["feels_like"])
+    humidity = data["main"]["humidity"]
+    description = data["weather"][0]["description"]
+    city_name = data["name"]
+
+    await update.message.reply_text(f"Запомнил город: {city_name} 🌍")
+    await show_menu(update, context)
+
+    text = (
+        f"🌤 Погода в {city_name}\n"
+        f"{description.capitalize()}\n\n"
+        f"🌡 Температура: {temp}°C\n"
+        f"🤗 Ощущается как: {feels_like}°C\n"
+        f"💧 Влажность: {humidity}%\n"
+        f"ℹ️ Хотите подробности — выберите пункт ниже 👇"
+    )
+    await update.message.reply_text(text)
+
+
+# ================== /weather ==================
+async def weather(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    city = " ".join(context.args) if context.args else "London"
+    context.args = [city]
+    await echo(update, context)
+
+
+# ================== Меню ==================
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # кнопки последних городов
+    recent_cities = context.user_data.get("recent_cities", [])
+    keyboard = [recent_cities] if recent_cities else []
+
+    # стандартные кнопки
+    keyboard += [
+        ["📊 Сегодня подробно", "🌅 Завтра"],
+        ["📅 На 3 дня"],
+        ["🏙 Сменить город"]
+    ]
+
+    reply_markup = ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True
+    )
+
+    await update.message.reply_text(
+        "Что Вас интересует? 👇",
+        reply_markup=reply_markup
+    )
+
+
+# ================== Основной обработчик меню ==================
+async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    city = context.user_data.get("city")
+
+    if not city:
+        await update.message.reply_text("Сначала выберите город 🌍")
+        return
+
+    # ------------------ Сегодня подробно ------------------
+    if text == "📊 Сегодня подробно" or text in context.user_data.get("recent_cities", []):
+        data = get_forecast(city)
+        if not data:
+            await update.message.reply_text("Не удалось получить прогноз 😔")
+            return
+
+        # Умный прогноз ближайшего часа
+        current = data["list"][0]
+        smart_text = smart_weather_text(
+            temp=round(current["main"]["temp"]),
+            feels_like=round(current["main"]["feels_like"]),
+            description=current["weather"][0]["description"],
+            wind_speed=current["wind"]["speed"],
+            day="сегодня"
+        )
+        await update.message.reply_text(smart_text)
+
+        # прогноз по часам с эмоджи
+        message = f"🌤 Погода сегодня в {city}\n\n"
+        target_hours = ["06:00", "09:00", "12:00", "15:00", "18:00", "21:00"]
+        for item in data["list"]:
+            time = item["dt_txt"][11:16]
+            if time in target_hours:
+                temp = round(item["main"]["temp"])
+                desc = item["weather"][0]["description"]
+                emoji = get_weather_emoji(desc)
+                message += f"🕒 {time} — {emoji} {temp}°C, {desc}\n"
+        await update.message.reply_text(message)
+
+    # ------------------ Завтра ------------------
+    elif text == "🌅 Завтра":
+        data = get_forecast(city)
+        if not data:
+            await update.message.reply_text("Не удалось получить прогноз 😔")
+            return
+
+        tomorrow_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        target_hours = ["06:00", "09:00", "12:00", "15:00", "18:00", "21:00"]
+
+        tomorrow_items = [
+            item for item in data["list"]
+            if item["dt_txt"].startswith(tomorrow_date)
+        ]
+        if not tomorrow_items:
+            await update.message.reply_text("Нет данных на завтра 😕")
+            return
+
+        # умный текст около середины дня
+        main_item = tomorrow_items[len(tomorrow_items) // 2]
+        smart_text = smart_weather_text(
+            temp=round(main_item["main"]["temp"]),
+            feels_like=round(main_item["main"]["feels_like"]),
+            description=main_item["weather"][0]["description"],
+            wind_speed=main_item["wind"]["speed"],
+            day="завтра"
+        )
+        await update.message.reply_text(smart_text)
+
+        # прогноз по часам
+        message = f"🌅 Погода завтра в {city}\n\n"
+        for item in tomorrow_items:
+            time = item["dt_txt"][11:16]
+            if time in target_hours:
+                temp = round(item["main"]["temp"])
+                desc = item["weather"][0]["description"]
+                emoji = get_weather_emoji(desc)
+                message += f"🕒 {time} — {emoji} {temp}°C, {desc}\n"
+        await update.message.reply_text(message)
+
+    # ------------------ На 3 дня ------------------
+    elif text == "📅 На 3 дня":
+        data = get_forecast(city)
+        if not data:
+            await update.message.reply_text("Не удалось получить прогноз 😔")
+            return
+
+        days = {}
+        target_hours = ["06:00", "12:00", "18:00"]
+        for item in data["list"]:
+            date, time = item["dt_txt"].split(" ")
+            if time[:5] in target_hours:
+                days.setdefault(date, []).append(item)
+
+        message = f"📅 Прогноз на 3 дня для {city}\n\n"
+        for date, items in list(days.items())[:3]:
+            day_name = datetime.strptime(date, "%Y-%m-%d").strftime("%A")
+            message += f"📆 {date} ({day_name})\n"
+            for item in items:
+                time = item["dt_txt"][11:16]
+                temp = round(item["main"]["temp"])
+                desc = item["weather"][0]["description"]
+                emoji = get_weather_emoji(desc)
+                message += f"   • {time} — {emoji} {desc}, {temp}°C\n"
+            message += "\n"
+        await update.message.reply_text(message)
+
+    # ------------------ Сменить город ------------------
+    elif text == "🏙 Сменить город":
+        context.user_data.pop("city", None)
+        await update.message.reply_text("Хорошо 🙂 Напишите новый город 🌍")
+
+
+# ================== Эмоджи для погоды ==================
+def get_weather_emoji(description: str):
+    description = description.lower()
+    if "дождь" in description:
+        return "🌧"
+    elif "снег" in description:
+        return "❄️"
+    elif "облачно" in description:
+        return "☁️"
+    elif "ясно" in description:
+        return "☀️"
+    elif "туман" in description:
+        return "🌫"
+    else:
+        return "🌡"
+
+
+# ================== Умный текст ==================
+def smart_weather_text(temp, feels_like, description, wind_speed=None, day="сегодня"):
+    text = f"🧠 Что по ощущениям {day}:\n"
+
+    # Температура
+    if temp <= 0:
+        text += "❄️ Очень холодно. "
+    elif 1 <= temp <= 7:
+        text += "🧥 Прохладно. "
+    elif 8 <= temp <= 15:
+        text += "🙂 Комфортно, но без жары. "
+    elif 16 <= temp <= 25:
+        text += "😌 Тепло и приятно. "
+    else:
+        text += "🔥 Жарко. "
+
+    # Ощущается как
+    if feels_like < temp - 2:
+        text += "Ощущается заметно холоднее. "
+    elif feels_like > temp + 2:
+        text += "По ощущениям теплее, чем показывает термометр. "
+
+    # Описание погоды
+    if "дождь" in description:
+        text += "🌧 Возможны осадки — зонт будет кстати. "
+    elif "снег" in description:
+        text += "❄️ Снег — будь осторожен на дороге. "
+    elif "облачно" in description:
+        text += "☁️ Пасмурно, солнце может прятаться. "
+    elif "ясно" in description:
+        text += "☀️ Ясно и приятно. "
+    elif "туман" in description:
+        text += "🌫 Туман может снижать видимость. "
+
+    # Ветер
+    if wind_speed:
+        if wind_speed >= 8:
+            text += "💨 Сильный ветер усиливает ощущения холода."
+        elif wind_speed >= 4:
+            text += "🌬 Умеренный ветер."
+
+    return text
+
+
+# ================== Получение прогноза ==================
+def get_forecast(city: str):
+    url = (
+        "https://api.openweathermap.org/data/2.5/forecast"
+        f"?q={city}&appid={WEATHER_API_KEY}&units=metric&lang=ru"
+    )
+    response = requests.get(url)
+    if response.status_code != 200:
+        return None
+    return response.json()
+
+
+# ================== MAIN ==================
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.Text(["Старт"]), handle_start_button))
+    app.add_handler(CommandHandler("weather", weather))
+    app.add_handler(MessageHandler(
+        filters.Text([
+            "📊 Сегодня подробно", "🌅 Завтра", "📅 На 3 дня", "🏙 Сменить город"
+        ]), handle_menu))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+    app.run_polling()
